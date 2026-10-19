@@ -1,0 +1,16 @@
+# Secrets: real API keys live here and must never be committed
+.env
+
+# Output and raw data: contains directors' personal data, keep off GitHub
+data/
+output/
+*.csv
+
+# Python clutter
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Mac clutter
+.DS_Store
