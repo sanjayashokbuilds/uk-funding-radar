@@ -41,6 +41,10 @@ MAX_AGE_YEARS = 5
 # Safe lower bound: comfortably older than 5 years, so we never wrongly drop
 # a young company. Exact age is checked properly from the profile anyway.
 MIN_COMPANY_NUMBER = 12_000_000
+# The stream re-sends OLD filings whenever Companies House updates them
+# (found in the first real run: an SH01 from April 2025 came through).
+# So we only keep SH01s actually filed recently.
+MAX_FILING_AGE_DAYS = 14
 
 # London postcode areas (inner London). Outer areas like HA, KT, BR also
 # cover places outside London, so we don't use them.
@@ -69,9 +73,27 @@ BIG_INCREASE_PCT = 5.0      # priced rounds typically add ~10-25% new shares
 TINY_INCREASE_PCT = 1.0     # below this: option exercises, small top-ups
 FREQUENT_SH01S = 4          # this many SH01s in the past year = drip pattern
 FOUNDER_WINDOW_DAYS = 90    # SH01s this soon after incorporation = founder shares
+SHELL_INCREASE_PCT = 500.0  # VC rounds rarely add 5x the shares; shells being
+                            # capitalised for a buyout or restructuring often do
+
+# Names that signal a deal / buyout vehicle rather than a startup
+# (found in the first real run: ZEUS UK BIDCO, CRIMSON TOPCO, PROJECT CASTLE...)
+DEAL_VEHICLE_NAME = re.compile(
+    r"\b(BIDCO|MIDCO|TOPCO|HOLDCO|FINCO|DEBTCO|INVESTCO|MANCO|PROPCO|NOMINEES?"
+    r"|ACQUISITIONS?|JV CO|INVESTMENT PLATFORM|INVESTMENT HOLDINGS)\b|^PROJECT\b")
 
 
 # --- Pure logic (no network), easy to test ------------------------------
+
+def stale_filing_check(sh01: dict, today: date) -> Optional[str]:
+    """Drop SH01s filed long ago that the stream re-sent after an update.
+    Measured against the day we collected it, so re-scoring later is safe."""
+    filed = sh01.get("filing_date")
+    seen = date.fromisoformat(sh01["collected_on"]) if sh01.get("collected_on") else today
+    if filed and date.fromisoformat(filed) < seen - timedelta(days=MAX_FILING_AGE_DAYS):
+        return f"filed {filed}: an old filing re-sent by the stream"
+    return None
+
 
 def cheap_number_check(company_number: str) -> Optional[str]:
     """Return a reason to drop the company, or None to keep it."""
@@ -149,16 +171,24 @@ def days_between(a: str, b: str) -> int:
     return abs((date.fromisoformat(a) - date.fromisoformat(b)).days)
 
 
-def score_funding_round(sh01: dict, history_items: list, incorporated: str) -> dict:
+def score_funding_round(sh01: dict, history_items: list, incorporated: str,
+                        company_name: str = "", sector: str = "tech") -> dict:
     """Score how much this SH01 looks like a funding round.
     Returns flag (likely / uncertain / unlikely), score, % increase and reasons."""
     score, reasons = 0, []
     anchor = sh01["allotment_date"] or sh01["filing_date"]
 
+    if DEAL_VEHICLE_NAME.search((company_name or "").upper()):
+        score -= 3
+        reasons.append("name suggests a deal/buyout vehicle, not a startup")
+
     pct = percent_increase(capital_amounts(sh01["capital"]),
                            previous_capital(history_items, sh01))
     if pct is None:
         reasons.append("no earlier capital figure to compare")
+    elif pct > SHELL_INCREASE_PCT:
+        reasons.append(f"share capital up {pct}% (too big for a typical round: "
+                       "often a shell or restructuring)")
     elif pct >= BIG_INCREASE_PCT:
         score += 2
         reasons.append(f"share capital up {pct}%")
@@ -190,6 +220,9 @@ def score_funding_round(sh01: dict, history_items: list, incorporated: str) -> d
         reasons.append("allotted within 90 days of incorporation (founder shares?)")
 
     flag = "likely" if score >= 3 else "uncertain" if score >= 1 else "unlikely"
+    if flag == "likely" and sector != "tech":
+        flag = "uncertain"  # holding companies: sector unknown, so never 'likely'
+        reasons.append("holding company, so capped at uncertain")
     return {"flag": flag, "score": score, "pct_increase": pct, "reasons": "; ".join(reasons)}
 
 
@@ -205,11 +238,17 @@ def load_assessed() -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Filter and score collected SH01s.")
     parser.add_argument("--limit", type=int, help="only check this many new SH01s")
+    parser.add_argument("--rescore", action="store_true",
+                        help="re-score SH01s already scored (after changing the rules)")
     args = parser.parse_args(argv)
 
     today = date.today()
     assessed = load_assessed()
-    todo = [s for s in load_sh01s() if s["filing_id"] not in assessed]
+    if args.rescore:
+        rescore_ids = {fid for fid, r in assessed.items() if r.get("flag")}
+        todo = [s for s in load_sh01s() if s["filing_id"] in rescore_ids]
+    else:
+        todo = [s for s in load_sh01s() if s["filing_id"] not in assessed]
     if args.limit:
         todo = todo[:args.limit]
     cache = json.loads(PROFILE_CACHE.read_text()) if PROFILE_CACHE.exists() else {}
@@ -227,7 +266,8 @@ def main(argv=None) -> int:
         with ASSESSED_FILE.open("a") as out:
             for n, sh01 in enumerate(todo, 1):
                 row = dict(sh01)
-                drop = cheap_number_check(sh01["company_number"])
+                drop = (stale_filing_check(sh01, today)
+                        or cheap_number_check(sh01["company_number"]))
                 if drop:
                     funnel["number"] += 1
                 else:
@@ -240,7 +280,8 @@ def main(argv=None) -> int:
                     else:
                         history = client.filing_history(sh01["company_number"], items_per_page=100)
                         result = score_funding_round(sh01, (history or {}).get("items", []),
-                                                     profile.get("date_of_creation"))
+                                                     profile.get("date_of_creation"),
+                                                     profile.get("company_name", ""), sector)
                         funnel["scored"] += 1
                         row.update(result, sector=sector,
                                    company_name=profile.get("company_name"),
@@ -258,15 +299,20 @@ def main(argv=None) -> int:
     finally:
         PROFILE_CACHE.write_text(json.dumps(cache))
 
-    scored = [r for r in load_assessed().values() if r.get("flag")]
+    best = {}
+    for r in load_assessed().values():
+        if r.get("flag") and (r["company_number"] not in best
+                              or r["score"] > best[r["company_number"]]["score"]):
+            best[r["company_number"]] = r
+    scored = list(best.values())  # one line per company: its best-scoring SH01
     print(f"\nFunnel for this run ({client.requests_made} API requests):")
     print(f"  {funnel['checked']} SH01s checked")
-    print(f"  -{funnel['number']} dropped by company number (too old / not E&W)")
+    print(f"  -{funnel['number']} dropped as old filings or by company number (too old / not E&W)")
     print(f"  -{funnel['profile']} dropped by profile (not active, London, tech, or young)")
     print(f"  = {funnel['scored']} London tech startups scored")
     for flag in ("likely", "uncertain", "unlikely"):
         rows = [r for r in scored if r["flag"] == flag]
-        print(f"\n{flag.upper()} ({len(rows)} so far):")
+        print(f"\n{flag.upper()} ({len(rows)} companies so far):")
         for r in sorted(rows, key=lambda r: -r["score"])[:15]:
             print(f"  {r['company_name']} ({r['company_number']}) score {r['score']}: {r['reasons']}")
     return 0

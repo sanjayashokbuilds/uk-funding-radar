@@ -12,6 +12,7 @@ Usage:
     python -m radar.export
     python -m radar.export --rebuild      # one CSV with everything so far
     python -m radar.export --all-flags    # include 'unlikely' rows too
+    python -m radar.export --tech-only    # leave out holding companies
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ EXPORTED_FILE = DATA_DIR / "exported_ids.json"
 
 COLUMNS = [
     "company_number", "company_name", "likely_funding_round", "score", "reason",
+    "sh01_filings_this_batch",
     "share_capital_increase_pct", "filing_date", "allotment_date",
     "sic_codes", "sector", "registered_address", "incorporated",
     "directors", "companies_house_link",
@@ -50,6 +52,18 @@ def format_directors(officers_response) -> str:
     )
 
 
+def best_per_company(rows: list) -> list:
+    """One round is often filed as several SH01s. Keep each company's
+    best-scoring filing and count how many there were."""
+    best, counts = {}, {}
+    for r in rows:
+        n = r["company_number"]
+        counts[n] = counts.get(n, 0) + 1
+        if n not in best or r["score"] > best[n]["score"]:
+            best[n] = r
+    return [dict(r, filings_count=counts[n]) for n, r in best.items()]
+
+
 def to_csv_row(row: dict, directors: str) -> dict:
     return {
         "company_number": row["company_number"],
@@ -57,6 +71,7 @@ def to_csv_row(row: dict, directors: str) -> dict:
         "likely_funding_round": row["flag"],
         "score": row["score"],
         "reason": row["reasons"],
+        "sh01_filings_this_batch": row.get("filings_count", 1),
         "share_capital_increase_pct": row.get("pct_increase"),
         "filing_date": row.get("filing_date"),
         "allotment_date": row.get("allotment_date"),
@@ -76,13 +91,16 @@ def main(argv=None) -> int:
                         help="export everything so far, not just new rows")
     parser.add_argument("--all-flags", action="store_true",
                         help="include 'unlikely' rows")
+    parser.add_argument("--tech-only", action="store_true",
+                        help="leave out holding companies (sector unclear)")
     args = parser.parse_args(argv)
 
     flags = {"likely", "uncertain"} | ({"unlikely"} if args.all_flags else set())
     exported = set() if args.rebuild or not EXPORTED_FILE.exists() \
         else set(json.loads(EXPORTED_FILE.read_text()))
     rows = [r for r in load_assessed().values()
-            if r.get("flag") in flags and r["filing_id"] not in exported]
+            if r.get("flag") in flags and r["filing_id"] not in exported
+            and not (args.tech_only and r.get("sector") != "tech")]
 
     if not rows:
         print("No new likely/uncertain funding rounds to export.")
@@ -90,13 +108,8 @@ def main(argv=None) -> int:
 
     try:
         client = CompaniesHouseClient()
-        csv_rows = []
-        directors_by_company = {}  # one officers call per company, not per filing
-        for r in rows:
-            number = r["company_number"]
-            if number not in directors_by_company:
-                directors_by_company[number] = format_directors(client.officers(number))
-            csv_rows.append(to_csv_row(r, directors_by_company[number]))
+        csv_rows = [to_csv_row(r, format_directors(client.officers(r["company_number"])))
+                    for r in best_per_company(rows)]  # one officers call per company
     except CompaniesHouseError as err:
         print(f"Error: {err}")
         return 1

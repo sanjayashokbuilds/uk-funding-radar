@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import time
+from datetime import date
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -189,6 +190,7 @@ def collect(key: str, start_tp: int, finish_tp: int, max_minutes: float) -> dict
                 last_tp = int(tp)
             record = parse_sh01(event)
             if record:
+                record["collected_on"] = date.today().isoformat()
                 batch.append(record)
             if events % 50_000 == 0:  # checkpoint so a crash loses little
                 append_sh01s(batch)
