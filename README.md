@@ -141,7 +141,7 @@ one is in the commit history and covered by a test:
 - **Old filings re-sent by the stream** (one was from April 2025). Fixed with
   the 14-day filing-date check.
 
-After the fixes there were 11 "likely" companies. A one-week comparison against
+After the fixes there were 8 "likely" companies. A one-week comparison against
 published funding news is in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Limitations
